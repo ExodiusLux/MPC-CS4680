@@ -10,7 +10,6 @@ dotenv.config();
 const { OPENAI_API_KEY } = process.env;
 
 if (!OPENAI_API_KEY) {
-  // eslint-disable-next-line no-console
   console.warn('OPENAI_API_KEY is not set. Agent requests will fail.');
 }
 
@@ -65,15 +64,20 @@ const scheduleReminder = (reminder) => {
 const systemPrompt = `
 You are an AI productivity orchestrator. Always respond with strict JSON using this schema:
 {
-  "action": "add_task" | "add_note" | "schedule_reminder" | "update_reminder" | "cancel_reminder" | "draft_email",
-  "payload": {
-     // fields described below
-  }
+  "actions": [
+    {
+      "action": "add_task" | "add_note" | "schedule_reminder" | "update_reminder" | "cancel_reminder" | "draft_email",
+      "payload": {}
+    }
+  ]
 }
+
+You can return multiple actions if the user's request naturally maps to multiple operations.
+For example, "task for taking out trash and remind me tomorrow" returns TWO actions.
 
 Rules:
 - If user wants to remember something without a schedule, produce add_note with "body".
-- For todos, use add_task with "description".
+- For todos, use add_task with "description" and optional "dueDate" (for tasks scheduled on future days, use natural language like "December 25" or "next Monday", or ISO 8601 date format YYYY-MM-DD).
 - For new reminders, use schedule_reminder with "message" and "dueTime".
 - For dueTime: Use natural language relative time descriptions (e.g., "in 1 minute", "in 2 hours", "tomorrow at 8am", "next Monday at 9:00") OR ISO 8601 format (YYYY-MM-DDTHH:MM:SS). The system will parse these automatically.
 - To change an existing reminder, use update_reminder with "reminderId" and optional "message" and/or "dueTime".
@@ -110,10 +114,16 @@ const extractJsonObject = (raw) => {
 
 const parseAiResponse = (raw) => {
   const data = extractJsonObject(raw);
-  if (!data.action || typeof data.payload !== 'object') {
-    throw new Error('Agent response missing action or payload.');
+  if (data.actions && Array.isArray(data.actions)) {
+    if (data.actions.length === 0) {
+      throw new Error('Agent response contains no actions.');
+    }
+    return data.actions;
+  } else if (data.action && typeof data.payload === 'object') {
+    return [data];
+  } else {
+    throw new Error('Agent response missing actions or action/payload.');
   }
-  return data;
 };
 
 const parseEmailDraft = (raw) => {
@@ -141,11 +151,11 @@ const interpretCommand = async (text) => {
     {
       role: 'user',
       content: `
-Current reminders:
-${JSON.stringify(reminderContext, null, 2)}
+        Current reminders:
+        ${JSON.stringify(reminderContext, null, 2)}
 
-User request: """${text}"""
-Respond with JSON only.`,
+        User request: """${text}"""
+        Respond with JSON only.`,
     },
   ];
 
@@ -159,8 +169,13 @@ Respond with JSON only.`,
   return completion.choices[0].message?.content;
 };
 
-const createTask = (description) => {
-  const task = { id: randomUUID(), description, createdAt: Date.now() };
+const createTask = (description, dueDate = null) => {
+  const task = {
+    id: randomUUID(),
+    description,
+    createdAt: Date.now(),
+    dueDate: dueDate ? parseTaskDate(dueDate) : null,
+  };
   store.tasks.push(task);
   return task;
 };
@@ -213,18 +228,42 @@ const draftEmail = async (instructions, { persist = true } = {}) => {
   return draft;
 };
 
+const parseTaskDate = (dueDate) => {
+  let parsed = null;
+  
+  // Try parsing with chrono for natural language dates like "December 25", "next Monday"
+  parsed = chrono.parseDate(dueDate, new Date(), { forwardDate: true });
+  
+  // If chrono fails, try ISO date format (YYYY-MM-DD)
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    // Check if it's ISO date format and parse it as midnight local time
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+      const [y, m, d] = dueDate.split('-').map(Number);
+      parsed = new Date(y, m - 1, d, 0, 0, 0, 0);
+    }
+  }
+  
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    throw new Error(`Invalid task date: ${dueDate}. Please use formats like "December 25" or "2025-12-25".`);
+  }
+  
+  // Set to midnight for date-only tasks
+  parsed.setHours(0, 0, 0, 0);
+  return parsed.getTime();
+};
+
 const parseReminderTime = (dueTime) => {
   const now = new Date();
   let parsed = null;
   
   // First, try parsing with chrono (handles relative times like "in 1 minute", "tomorrow at 8am")
-  parsed = chrono.parseDate(dueTime, now, { forwardDate: true });
+  // Use a fresh Date object to avoid timezone issues
+  parsed = chrono.parseDate(dueTime, new Date(), { forwardDate: true });
   
-  // If chrono fails, try parsing as ISO string or standard date format
+  // If chrono fails or produces an invalid date, try parsing as ISO string
   if (!parsed || Number.isNaN(parsed.getTime())) {
     const isoParsed = new Date(dueTime);
-    // Only use if it's a valid date and not in the past (unless it's very recent)
-    if (!Number.isNaN(isoParsed.getTime()) && isoParsed.getTime() >= now.getTime() - 60000) {
+    if (!Number.isNaN(isoParsed.getTime())) {
       parsed = isoParsed;
     }
   }
@@ -311,48 +350,45 @@ app.post('/agent', async (req, res) => {
 
   try {
     const aiRaw = await interpretCommand(text);
-    const { action, payload } = parseAiResponse(aiRaw);
+    const actionsList = parseAiResponse(aiRaw);
 
-    if (!action || typeof payload !== 'object') {
-      throw new Error('Agent response missing action or payload.');
-    }
+    const results = [];
+    for (const { action, payload } of actionsList) {
+      if (!action || typeof payload !== 'object') {
+        throw new Error('Agent response missing action or payload.');
+      }
 
-    let item;
-    switch (action) {
-      case 'add_task':
-        item = createTask(payload.description || text);
-        break;
-      case 'add_note':
-        item = createNote(payload.body || text);
-        break;
-      case 'schedule_reminder':
-        if (!payload.message || !payload.dueTime) {
-          throw new Error('schedule_reminder requires message and dueTime.');
-        }
-        // If dueTime looks like a relative description, try parsing the original text for better context
-        if (!payload.dueTime.match(/^\d{4}-\d{2}-\d{2}T/)) {
-          // Not an ISO string, try parsing the original user text for time context
-          const textTime = chrono.parseDate(text, new Date(), { forwardDate: true });
-          if (textTime && !Number.isNaN(textTime.getTime())) {
-            payload.dueTime = textTime.toISOString();
+      let item;
+      switch (action) {
+        case 'add_task':
+          item = createTask(payload.description || text, payload.dueDate || null);
+          break;
+        case 'add_note':
+          item = createNote(payload.body || text);
+          break;
+        case 'schedule_reminder':
+          if (!payload.message || !payload.dueTime) {
+            throw new Error('schedule_reminder requires message and dueTime.');
           }
-        }
-        item = createReminder(payload);
-        break;
-      case 'update_reminder':
-        item = updateReminder(payload);
-        break;
-      case 'cancel_reminder':
-        item = deleteReminder(payload.reminderId);
-        break;
-      case 'draft_email':
-        item = await draftEmail(payload.instructions || text);
-        break;
-      default:
-        throw new Error(`Unsupported action: ${action}`);
+          item = createReminder(payload);
+          break;
+        case 'update_reminder':
+          item = updateReminder(payload);
+          break;
+        case 'cancel_reminder':
+          item = deleteReminder(payload.reminderId);
+          break;
+        case 'draft_email':
+          item = await draftEmail(payload.instructions || text);
+          break;
+        default:
+          throw new Error(`Unsupported action: ${action}`);
+      }
+
+      results.push({ action, item });
     }
 
-    return res.json({ action, item, state: store });
+    return res.json({ actions: results, state: store });
   } catch (error) {
     console.error('Agent error:', error);
     return res.status(400).json({ error: error.message });

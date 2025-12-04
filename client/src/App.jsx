@@ -3,6 +3,14 @@ import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 
+// Return a local date key in YYYY-MM-DD using local time (avoids UTC shift issues)
+const getDateKey = (input) => {
+  const d = input instanceof Date ? new Date(input.getTime()) : new Date(input);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+    d.getDate()
+  ).padStart(2, '0')}`;
+};
+
 const Section = ({ title, items, renderItem, emptyLabel }) => (
   <section className="panel">
     <header>
@@ -66,79 +74,79 @@ const EmailDraftSection = ({ drafts, onCopy, copiedId, copyError }) => (
 
 const DaySummary = ({ reminders, tasks }) => {
   const todayItems = useMemo(() => {
-    // Use the exact same grouping logic as ReminderSchedule
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const grouped = {};
-    
-    // Initialize today's date key (same as ReminderSchedule)
-    const todayKey = today.toISOString().split('T')[0];
+
+    // Initialize today's and adjacent days' keys using local date keys
+    const todayKey = getDateKey(today);
     grouped[todayKey] = { reminders: [], tasks: [] };
-    
-    // Also check adjacent days in case of timezone edge cases
+
     const yesterday = new Date(today);
     yesterday.setDate(today.getDate() - 1);
-    const yesterdayKey = yesterday.toISOString().split('T')[0];
+    const yesterdayKey = getDateKey(yesterday);
     grouped[yesterdayKey] = { reminders: [], tasks: [] };
-    
+
     const tomorrow = new Date(today);
     tomorrow.setDate(today.getDate() + 1);
-    const tomorrowKey = tomorrow.toISOString().split('T')[0];
+    const tomorrowKey = getDateKey(tomorrow);
     grouped[tomorrowKey] = { reminders: [], tasks: [] };
-    
+
     // Filter out due reminders - they should only appear in notifications
     const activeReminders = reminders.filter((r) => r.status !== 'due');
-    
-    // Group reminders by due date (same logic as ReminderSchedule)
+
+    // Group reminders by due date (same logic as ReminderSchedule) using local keys
     activeReminders.forEach((reminder) => {
       const reminderDate = new Date(reminder.dueTime);
-      const dateKey = reminderDate.toISOString().split('T')[0];
+      const dateKey = getDateKey(reminderDate);
       if (grouped[dateKey]) {
         grouped[dateKey].reminders.push(reminder);
       }
     });
-    
-    // Group tasks by creation date (same logic as ReminderSchedule)
+
+    // Group tasks by creation date or due date
     tasks.forEach((task) => {
-      const taskDate = new Date(task.createdAt);
-      const dateKey = taskDate.toISOString().split('T')[0];
+      // Use dueDate if it exists, otherwise use createdAt
+      const taskDate = new Date(task.dueDate || task.createdAt);
+      const dateKey = getDateKey(taskDate);
       if (grouped[dateKey]) {
         grouped[dateKey].tasks.push(task);
       }
     });
-    
+
     // Find which dateKey would be labeled as "Today" using formatDayLabel logic
     const todayDateString = today.toDateString();
     let todayDateKey = null;
-    
+
     for (const dateKey of [todayKey, yesterdayKey, tomorrowKey]) {
-      const dayDate = new Date(dateKey);
+      const [y, m, d] = dateKey.split('-').map(Number);
+      const dayDate = new Date(y, m - 1, d);
       if (dayDate.toDateString() === todayDateString) {
         todayDateKey = dateKey;
         break;
       }
     }
-    
+
     // Extract items for the day that's labeled "Today"
     const todayData = todayDateKey ? grouped[todayDateKey] : { reminders: [], tasks: [] };
-    
+
     // Convert to summary format
-    const todayReminders = todayData.reminders.map((r) => ({ 
-      type: 'reminder', 
-      text: r.message, 
-      time: r.dueTime 
+    const todayReminders = todayData.reminders.map((r) => ({
+      type: 'reminder',
+      text: r.message,
+      time: r.dueTime,
     }));
-    
-    const todayTasks = todayData.tasks.map((t) => ({ 
-      type: 'task', 
-      text: t.description, 
-      time: t.createdAt 
+
+    const todayTasks = todayData.tasks.map((t) => ({
+      type: 'task',
+      text: t.description,
+      time: t.createdAt,
     }));
-    
+
     // Sort reminders by time, tasks by creation time (newest first) - same as ReminderSchedule
     todayReminders.sort((a, b) => a.time - b.time);
     todayTasks.sort((a, b) => b.time - a.time);
-    
+
     return [...todayReminders, ...todayTasks];
   }, [reminders, tasks]);
 
@@ -195,8 +203,6 @@ const DaySummary = ({ reminders, tasks }) => {
 };
 
 const ReminderSchedule = ({ reminders, tasks }) => {
-  const daysToShow = 7;
-
   // Filter out due reminders - they should only appear in notifications
   const activeReminders = useMemo(() => {
     return reminders.filter((r) => r.status !== 'due');
@@ -208,27 +214,29 @@ const ReminderSchedule = ({ reminders, tasks }) => {
     today.setHours(0, 0, 0, 0);
     const grouped = {};
     
-    // Initialize all days
-    for (let i = 0; i < daysToShow; i++) {
+    // Initialize today and a reasonable future range (90 days)
+    const daysToInitialize = 90;
+    for (let i = 0; i < daysToInitialize; i++) {
       const date = new Date(today);
       date.setDate(today.getDate() + i);
-      const dateKey = date.toISOString().split('T')[0];
+      const dateKey = getDateKey(date);
       grouped[dateKey] = { reminders: [], tasks: [] };
     }
 
     // Group reminders by due date (only active ones)
     activeReminders.forEach((reminder) => {
       const reminderDate = new Date(reminder.dueTime);
-      const dateKey = reminderDate.toISOString().split('T')[0];
+      const dateKey = getDateKey(reminderDate);
       if (grouped[dateKey]) {
         grouped[dateKey].reminders.push(reminder);
       }
     });
 
-    // Group tasks by creation date
+    // Group tasks by creation date or due date
     tasks.forEach((task) => {
-      const taskDate = new Date(task.createdAt);
-      const dateKey = taskDate.toISOString().split('T')[0];
+      // Use dueDate if it exists, otherwise use createdAt
+      const taskDate = new Date(task.dueDate || task.createdAt);
+      const dateKey = getDateKey(taskDate);
       if (grouped[dateKey]) {
         grouped[dateKey].tasks.push(task);
       }
@@ -244,7 +252,9 @@ const ReminderSchedule = ({ reminders, tasks }) => {
   }, [activeReminders, tasks]);
 
   const formatDayLabel = (date) => {
-    const dayDate = new Date(date);
+    // `date` here is a YYYY-MM-DD local date key; construct a local Date
+    const [y, m, d] = date.split('-').map(Number);
+    const dayDate = new Date(y, m - 1, d);
     const todayDate = new Date();
     todayDate.setHours(0, 0, 0, 0);
     const tomorrowDate = new Date(todayDate);
@@ -449,10 +459,17 @@ function App() {
         ...data.state,
         emailDrafts: data.state.emailDrafts ?? [],
       });
+      
+      const actionCount = data.actions?.length ?? 1;
+      const actionTypes = data.actions?.map(a => a.action).join(', ') ?? 'unknown';
+      const successMessage = actionCount === 1 
+        ? `Action ${actionTypes} succeeded.`
+        : `${actionCount} actions succeeded: ${actionTypes}`;
+      
       setStatus({
         loading: false,
         error: '',
-        message: `Action ${data.action} succeeded.`,
+        message: successMessage,
       });
       setInput('');
     } catch (error) {
